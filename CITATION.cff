@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this software or the GQLSA attention mechanism in your research, please cite both the paper and this repository."
+title: "GQLSA: Grouped-Query Latent Sparse Attention"
+type: software
+authors:
+  - family-names: Sabid
+    given-names: Fardin
+    affiliation: "Independent Researcher"
+    email: contact.fardinsabid@gmail.com
+repository-code: "https://github.com/fardinsabid/gqlsa"
+url: "https://doi.org/10.5281/zenodo.22818585"
+abstract: >-
+  A compositional attention mechanism combining latent KV compression
+  (MLA-style), grouped-query head sharing (GQA-style), and content-retrieved
+  block sparsity with a fully vectorized random-projection inverted index.
+  Linear O(T) attention compute with 4.00x FLOP reduction, 3.68x wall-clock
+  speedup, 2.03x memory reduction, and 15.5x KV cache compression vs MHA
+  at 4096 tokens on a Tesla T4.
+keywords:
+  - sparse attention
+  - efficient transformers
+  - long-context
+  - grouped-query attention
+  - latent attention
+  - large language models
+  - attention mechanism
+license: CC-BY-NC-SA-4.0
+version: "1.0.0"
+date-released: "2026-09-18"
+preferred-citation:
+  type: article
+  title: "Grouped-Query Latent Sparse Attention: Compute Only Where It Matters"
+  authors:
+    - family-names: Sabid
+      given-names: Fardin
+      affiliation: "Independent Researcher"
+  year: 2026
+  doi: "10.5281/zenodo.22818585"
+  url: "https://doi.org/10.5281/zenodo.22818585"
