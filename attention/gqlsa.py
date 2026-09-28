@@ -140,7 +140,7 @@ class GQLSA(nn.Module):
         self.M = retrieval_M
         self.BUCKET_WIDTH = retrieval_bucket_width
         self.C_MAX = retrieval_c_max
-        self.B = bucket_count
+        self.BC = bucket_count
         
         # ── Pre-computed causal mask ──
         # Upper triangular matrix to prevent attending to future tokens
@@ -162,9 +162,9 @@ class GQLSA(nn.Module):
         no .tolist() calls, and no GPU→CPU synchronization. Every step
         is a bounded tensor operation.
 
-        Local blocks: positional, same pattern as V1.
+        Local blocks: positional.
         Global blocks: ReLU-scored retrieval over the full history.
-        Padding: preserves V1's (0 == q_block) causal fix.
+        Padding: preserves (0 == q_block) causal fix.
 
         Complexity:
             - Index build (sort + slot assignment): O(N · M · log(N · M))
@@ -177,7 +177,7 @@ class GQLSA(nn.Module):
         M = self.M
         BUCKET_WIDTH = self.BUCKET_WIDTH
         C_MAX = self.C_MAX
-        B = 8   # compact bucket count for the tensor index
+        B = self.BC   # compact bucket count for the tensor index
 
         if not hasattr(self, '_proj') or self._proj.device != device:
             self._proj = (
