@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 
-from attention.gqlsa import GQLSA
+from attention.gqlsa import GQLSA, GQLSAState
 
 
 def main():
@@ -83,6 +83,41 @@ def main():
     print(f"\nContent-dependence check (specific):")
     print(f"  Block indices differ for different inputs: {content_dependent}")
     print(f"  Result: {'PASS' if content_dependent else 'FAIL'}")
+
+    # ── Inference cache (v1.0.1) ──
+    # forward_step() generates one token at a time in O(k_eff · block_size),
+    # reusing cached K/V/latents from prior tokens. Output is numerically
+    # equivalent to running forward() on the full prefix and taking the
+    # last position.
+
+    print("\n" + "=" * 60)
+    print("Inference cache demo (forward_step)")
+    print("=" * 60)
+
+    # Use a smaller sequence for the demo
+    demo_len = 256
+    x_demo = torch.randn(1, demo_len, 4096, device=device)
+
+    # Reference: full forward on the whole sequence
+    with torch.no_grad():
+        out_full = attention(x_demo)                       # [1, demo_len, d_model]
+
+    # Cached: one token at a time via forward_step
+    state: GQLSAState = attention.init_state(
+        batch_size=1, max_seq_len=demo_len, device=device
+    )
+
+    outs = []
+    with torch.no_grad():
+        for i in range(demo_len):
+            o = attention.forward_step(x_demo[:, i:i+1], state, start_pos=i)
+            outs.append(o)
+    out_step = torch.cat(outs, dim=1)                      # [1, demo_len, d_model]
+
+    cache_diff = (out_full - out_step).abs().max().item()
+    print(f"Cached vs full forward max diff: {cache_diff:.3e}")
+    print(f"Result: {'PASS' if cache_diff < 1e-4 else 'FAIL'}")
+    print(f"State type: {type(state).__name__}")
 
 
 if __name__ == "__main__":

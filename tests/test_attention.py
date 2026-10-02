@@ -11,7 +11,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from attention.gqlsa import GQLSA
+from attention.gqlsa import GQLSA, GQLSAState
 
 
 @pytest.fixture
@@ -174,3 +174,67 @@ def test_causality(attention):
     assert max_diff < 1e-5, (
         f"Causal leakage detected: max diff {max_diff} at positions 0-4"
     )
+
+
+def test_cache_equivalence(attention):
+    """
+    forward_step() must produce the same output as forward() on the full
+    prefix, taken at the last position. This is the core correctness
+    guarantee of the v1.0.1 inference cache.
+    """
+
+    seq_len = 256
+    x = torch.randn(1, seq_len, attention.d_model)
+
+    # Reference: full forward
+    with torch.no_grad():
+        out_full = attention(x)                     # [1, seq_len, d_model]
+
+    # Cached: one token at a time
+    state: GQLSAState = attention.init_state(
+        batch_size=1, max_seq_len=seq_len, device=x.device
+    )
+
+    outs = []
+    with torch.no_grad():
+        for i in range(seq_len):
+            o = attention.forward_step(x[:, i:i+1], state, start_pos=i)
+            outs.append(o)
+    out_cached = torch.cat(outs, dim=1)              # [1, seq_len, d_model]
+
+    diff = (out_full - out_cached).abs().max().item()
+
+    assert diff < 1e-4, (
+        f"forward_step diverges from forward: max abs diff {diff:.3e}. "
+        f"Expected < 1e-4 (fp32 rounding)."
+    )
+
+
+def test_cache_rejects_multitoken(attention):
+    """forward_step() must reject inputs with seq_len > 1."""
+
+    state = attention.init_state(batch_size=1, max_seq_len=64)
+
+    x_multi = torch.randn(1, 2, attention.d_model)
+
+    with pytest.raises(ValueError, match="n=1"):
+        with torch.no_grad():
+            attention.forward_step(x_multi, state, start_pos=0)
+
+
+def test_cache_capacity_error(attention):
+    """Exceeding max_seq_len must raise a clear error."""
+
+    state = attention.init_state(batch_size=1, max_seq_len=4)
+
+    x = torch.randn(1, 1, attention.d_model)
+
+    # Consume the capacity
+    with torch.no_grad():
+        for i in range(4):
+            attention.forward_step(x, state, start_pos=i)
+
+    # Next one must fail
+    with pytest.raises(RuntimeError, match="capacity exceeded"):
+        with torch.no_grad():
+            attention.forward_step(x, state, start_pos=4)

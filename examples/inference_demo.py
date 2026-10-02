@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 import torch.nn as nn
 
-from attention.gqlsa import GQLSA
+from attention.gqlsa import GQLSA, GQLSAState
 
 
 class TransformerBlock(nn.Module):
@@ -102,6 +102,47 @@ def main():
     print(f"  Retrieval:    M={config['retrieval_M']}, "
           f"bucket_width={config['retrieval_bucket_width']}, "
           f"c_max={config['retrieval_c_max']}")
+
+    # ── Cached inference (v1.0.1) ──
+    # For generation, use GQLSA.forward_step() one token at a time.
+    # Cost per token is O(k_eff · block_size) — constant in sequence length,
+    # instead of the O(T) cost of re-running forward() on the growing prefix.
+
+    print("\n" + "=" * 60)
+    print("Cached generation demo")
+    print("=" * 60)
+
+    demo_len = 128
+    x_demo = torch.randn(1, demo_len, config["d_model"], device=device)
+
+    # Reference: full forward through the block
+    with torch.no_grad():
+        out_full = block(x_demo)
+
+    # Cached: run the block one token at a time. The attention uses
+    # forward_step(); the residual and FFN are per-token and stateless.
+    attn = block.attention
+    state: GQLSAState = attn.init_state(
+        batch_size=1, max_seq_len=demo_len, device=device
+    )
+
+    outs = []
+    with torch.no_grad():
+        for i in range(demo_len):
+            xi = x_demo[:, i:i+1]                             # [1, 1, d_model]
+            # attention sublayer
+            h_in = block.norm1(xi)
+            attn_out = attn.forward_step(h_in, state, start_pos=i)
+            xi = xi + attn_out
+            # ffn sublayer
+            xi = xi + block.ffn(block.norm2(xi))
+            outs.append(xi)
+    out_cached = torch.cat(outs, dim=1)
+
+    diff = (out_full - out_cached).abs().max().item()
+    print(f"Block output diff (cached vs full): {diff:.3e}")
+    print(f"Result: {'PASS' if diff < 1e-4 else 'FAIL'}")
+    print(f"State type: {type(state).__name__}")
 
 
 if __name__ == "__main__":

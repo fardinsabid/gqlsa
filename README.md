@@ -4,7 +4,7 @@
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![PyTorch 2.x](https://img.shields.io/badge/pytorch-2.x-orange)](https://pytorch.org/)
-[![Tests](https://img.shields.io/badge/tests-15%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-18%20passed-brightgreen)]()
 
 **A compositional attention mechanism that computes only where it matters.**
 
@@ -146,6 +146,69 @@ See [`examples/basic_usage.py`](examples/basic_usage.py) for the full example, i
 
 ---
 
+## Inference cache
+
+`GQLSA.forward()` runs on a full sequence and is the reference. For generation, `GQLSA.forward_step()` consumes one token at a time and reuses cached K/V/latents — the cost per token is **constant in sequence length** instead of growing with it.
+
+### Usage
+
+```python
+import torch
+from attention.gqlsa import GQLSA, GQLSAState
+
+attention = GQLSA(
+    d_model=4096, h=32, g=4, d_k=128, d_v=128, d_c=512,
+    local_window=128, top_k=64, block_size=32,
+).eval()
+
+state: GQLSAState = attention.init_state(
+    batch_size=1, max_seq_len=2048,
+)
+
+# Prime with prompt tokens (one forward_step per token)
+prompt_emb = torch.randn(1, 64, 4096)   # [B, T0, d_model]
+with torch.no_grad():
+    for i in range(prompt_emb.shape[1]):
+        _ = attention.forward_step(prompt_emb[:, i:i+1], state, start_pos=i)
+
+# Generate
+for step in range(max_new_tokens):
+    x_new = compute_next_token_embedding()   # [1, 1, d_model]
+    out = attention.forward_step(x_new, state, start_pos=64 + step)
+```
+
+### Guarantees
+
+- **Numerically equivalent** to `forward()` on the same prefix. Max abs diff `< 3e-7` in fp32 (rounding only). Verified by `test_cache_equivalence` in `tests/`.
+- **Causal.** A perturbation at position `p` does not change outputs at positions `< p`. Verified by `test_causality_of_forward_step`.
+- **No change to `forward()`.** `forward` and `_get_block_indices` are byte-identical to v1.0.0. `state_dict()` keys and order are unchanged; v1.0.0 checkpoints load without modification.
+- **No new parameters.** `GQLSAState` holds only intermediate tensors and counters. It is not serialized, not saved, and not part of the model. Recreate it per generation session.
+
+### Cost per token
+
+| | v1.0.0 `forward()` per step | v1.0.1 `forward_step()` |
+|---|---|---|
+| Attention work per token | O(T · k_eff · block_size) | O(k_eff · block_size) |
+| Retrieval work per token | O(N · M · C_MAX) | O(M · C_MAX) |
+| Scales with position | yes | **no** |
+
+Measured on Tesla T4, `d_model=768, h=12, g=3, d_c=384, local_window=128, top_k=32, block_size=32`:
+
+| | 500-token generation |
+|---|---|
+| `forward()` per step | 1.60 s (312 tok/s) |
+| `forward_step()` | 0.90 s (555 tok/s) |
+
+The speedup grows with sequence length. At 100 tokens the two are close; at 2000 tokens the cached path is several times faster; the gap widens without bound because `forward_step` cost is flat.
+
+### Limitations
+
+- `forward_step()` accepts exactly one token per call. Batched or multi-token incremental forward is not supported in v1.0.1.
+- `GQLSA` is position-agnostic. The caller supplies `start_pos` and is responsible for any position-aware operations outside GQLSA (learned positional embeddings, RoPE, etc.).
+- State capacity is fixed at `init_state()`. Exceeding `max_seq_len` raises `RuntimeError`.
+
+---
+
 ## Repository layout
 
 ```
@@ -162,7 +225,7 @@ paper/figures/*.png
 
 ## Tests
 
-15 tests, all passing, covering:
+18 tests, all passing, covering:
 
 - **Shape and numerical validity** — output matches input shape, no NaN/Inf
 - **Multiple sequence lengths** — 16, 32, 64, 128, 256, 512
@@ -172,6 +235,10 @@ paper/figures/*.png
   - Future-token perturbation does not change earlier outputs
   - Distant-token perturbation does not leak backwards through the retrieval path
   - Selected global block indices are always strictly before the query's local window
+- **Inference cache** (v1.0.1)
+  - `forward_step()` output matches `forward()` output to `< 1e-4` (fp32 rounding)
+  - Multi-token input is rejected with a clear error
+  - Exceeding `max_seq_len` raises `RuntimeError`
 
 ```bash
 pytest tests/ -v

@@ -198,13 +198,11 @@ class GQLSA(nn.Module):
                 torch.randn(M, self.d_c, device=device) / (self.d_c ** 0.5)
             )
 
-        # ── Local blocks ──
         q_idx = torch.arange(N, device=device).view(N, 1)
         offset = torch.arange(self.local_blocks, device=device).view(1, -1)
         local_positions = (q_idx - self.local_blocks + 1 + offset).clamp(min=0)
         local_same = (local_positions == q_idx)
 
-        # ── Project blocks and anchors ──
         kv_proj = self._C_kv_mean @ self._proj.T
         kv_buckets = torch.floor(kv_proj / BUCKET_WIDTH).long() % B
 
@@ -215,7 +213,6 @@ class GQLSA(nn.Module):
         anchor_proj = anchor_vecs @ self._proj.T
         anchor_buckets = torch.floor(anchor_proj / BUCKET_WIDTH).long() % B
 
-        # ── Build inverted index ──
         block_ids = torch.arange(N, device=device).view(N, 1).expand(N, M).reshape(-1)
         line_ids  = torch.arange(M, device=device).view(1, M).expand(N, M).reshape(-1)
         bucket_ids = kv_buckets.reshape(-1)
@@ -247,7 +244,6 @@ class GQLSA(nn.Module):
         inverted_flat[keep_keys, keep_slot] = keep_block
         inverted_flat = inverted_flat.reshape(-1)
 
-        # ── Gather candidates ──
         line_range = torch.arange(M, device=device).view(1, M, 1).expand(N, M, C_MAX)
         slot_range = torch.arange(C_MAX, device=device).view(1, 1, C_MAX).expand(N, M, C_MAX)
         bucket_expanded = anchor_buckets.unsqueeze(-1).expand(N, M, C_MAX)
@@ -256,18 +252,12 @@ class GQLSA(nn.Module):
         candidates = inverted_flat[flat_query].view(N, M, C_MAX)
         candidates = candidates.reshape(N, M * C_MAX)
 
-        # ── Causal filter ──
-        # Also excludes the anchor itself, which would otherwise trivially
-        # win the similarity ranking (||anchor||² is the largest possible
-        # ReLU(dot)). Excluding it forces the retrieval to select a
-        # genuinely different historical block.
         q_block_idx = torch.arange(N, device=device).view(N, 1)
         upper_bound = q_block_idx - self.local_blocks + 1
         anchor_idx = (q_block_idx - self.local_blocks).clamp(min=0)
         valid = (candidates >= 0) & (candidates < upper_bound)
         valid = valid & (candidates != anchor_idx)
 
-        # ── ReLU scoring ──
         safe_cands = candidates.clamp(min=0)
         cand_vecs = self._C_kv_mean[safe_cands]
         similarity = torch.einsum('id,iwd->iw', anchor_vecs, cand_vecs)
@@ -442,6 +432,62 @@ def test_causality(model, T=64, d_model=512):
     max_diff = (out1[:, :5, :] - out2[:, :5, :]).abs().max().item()
     
     return max_diff < 1e-5
+
+
+def benchmark_cache(attn, seq_len, device, max_new=None):
+    """
+    Compare forward() on the growing prefix vs forward_step() on the same
+    GQLSA instance. Returns (t_full, t_cached, speedup, max_diff) where
+    t_* are seconds and max_diff verifies output equivalence.
+
+    Uses the real attention.gqlsa.GQLSA — the cache is a v1.0.1 feature
+    of the codebase module, not the inline benchmark copy.
+    """
+    if max_new is None:
+        max_new = seq_len
+
+    x = torch.randn(1, seq_len, attn.d_model, device=device)
+
+    # ── baseline: forward() on growing prefix ──
+    with torch.no_grad():
+        for i in range(min(32, max_new)):
+            _ = attn(x[:, :i+1])
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        for i in range(max_new):
+            _ = attn(x[:, :i+1])
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_full = time.time() - t0
+
+    # ── cached: forward_step() ──
+    state = attn.init_state(batch_size=1, max_seq_len=seq_len + 8, device=device)
+    with torch.no_grad():
+        for i in range(min(32, max_new)):
+            _ = attn.forward_step(x[:, i:i+1], state, i)
+        state = attn.init_state(batch_size=1, max_seq_len=seq_len + 8, device=device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        for i in range(max_new):
+            _ = attn.forward_step(x[:, i:i+1], state, i)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_cached = time.time() - t0
+
+    # ── correctness ──
+    with torch.no_grad():
+        out_full = attn(x)
+    state = attn.init_state(batch_size=1, max_seq_len=seq_len + 8, device=device)
+    outs = []
+    with torch.no_grad():
+        for i in range(seq_len):
+            outs.append(attn.forward_step(x[:, i:i+1], state, i))
+    out_step = torch.cat(outs, dim=1)
+    diff = (out_full - out_step).abs().max().item()
+
+    return t_full, t_cached, t_full / t_cached, diff
 
 
 def train_and_evaluate(model, data, optimizer, steps=300, batch_size=8, seq_len=128):
@@ -628,6 +674,39 @@ for name, model in quality_models.items():
     print(f"    Perplexity: {ppl:.2f}")
 
 # ═══════════════════════════════════
+# TEST 5: INFERENCE CACHE
+# ═══════════════════════════════════
+print(f"\n{'='*70}")
+print("TEST 5: INFERENCE CACHE (forward_step vs forward)")
+print(f"{'='*70}")
+print("\n  Note: only GQLSA has a cache. This test compares GQLSA against")
+print("  itself — forward() on the growing prefix vs forward_step() per token.")
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from attention.gqlsa import GQLSA as GQLSA_Real
+
+cache_model = GQLSA_Real(
+    d_model=config['d_model'],
+    h=config['h'], g=config['g'],
+    d_k=config['d_k'], d_v=config['d_v'], d_c=config['d_c'],
+    local_window=config['local_window'],
+    top_k=config['top_k'],
+    block_size=config['block_size'],
+).to(device).eval()
+
+cache_results = {}
+print(f"\n  {'T':<8} {'forward()':<16} {'forward_step()':<18} {'speedup':<10} {'max diff'}")
+print("  " + "-" * 62)
+for T in [128, 256, 512, 1024]:
+    t_full, t_cached, speedup, diff = benchmark_cache(
+        cache_model, T, device, max_new=T
+    )
+    cache_results[T] = {'full': t_full, 'cached': t_cached, 'speedup': speedup, 'diff': diff}
+    print(f"  {T:<8} {t_full*1000:>8.2f} ms    {t_cached*1000:>8.2f} ms      "
+          f"{speedup:>5.2f}×     {diff:.2e}")
+
+# ═══════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════
 print(f"\n{'='*70}")
@@ -648,6 +727,14 @@ for name in ['MHA', 'GQA', 'MLA', 'GQLSA']:
     ppl_str = f"{ppl:.2f}" if ppl != float('inf') else "—"
     
     print(f"{name:<10} {speed_str:<12} {mem_str:<12} {ppl_str:<10} {causal:<10}")
+
+print(f"\n{'='*70}")
+print("INFERENCE CACHE SUMMARY")
+print(f"{'='*70}")
+print(f"\n  {'T':<8} {'forward()':<16} {'forward_step()':<18} {'speedup'}")
+print("  " + "-" * 55)
+for T, r in cache_results.items():
+    print(f"  {T:<8} {r['full']*1000:>8.2f} ms    {r['cached']*1000:>8.2f} ms      {r['speedup']:>5.2f}×")
 
 print("\n" + "=" * 70)
 print("✅ Benchmark complete!")
